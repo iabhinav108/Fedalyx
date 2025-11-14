@@ -1,61 +1,161 @@
-import torch, argparse, os
+# 01_train_teacher.py
+import argparse
+import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
-from src.models.teacher_model import build_teacher
-from src.data_utils.datasets import ImageListDataset
-from src.core.loss import KDLoss
-from config import CONFIG
+from torchvision import models
+import numpy as np
+from sklearn.metrics import roc_auc_score
+from pathlib import Path
+import json
 
-def train_one_epoch(model, loader, opt, device):
+from src.data_utils.dataloaders import get_global_dataloader
+
+# -------------------------
+# Train / Eval
+# -------------------------
+def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
-    ce = torch.nn.CrossEntropyLoss()
-    for x,y,_ in loader:
-        x,y = x.to(device), y.to(device)
-        opt.zero_grad(set_to_none=True)
-        loss = ce(model(x), y)
+    total_loss = 0
+    all_labels = []
+    all_logits = []
+
+    for xb, yb, _ in loader:
+        xb = xb.to(device)
+        yb = yb.float().to(device).unsqueeze(1)
+
+        optimizer.zero_grad()
+        out = model(xb)
+        loss = criterion(out, yb)
         loss.backward()
-        opt.step()
+        optimizer.step()
 
-def validate(model, loader, device):
-    model.eval(); correct=total=0
+        total_loss += loss.item() * xb.size(0)
+        all_labels.append(yb.cpu().numpy())
+        all_logits.append(out.detach().cpu().numpy())
+
+    labels = np.vstack(all_labels)
+    logits = np.vstack(all_logits)
+
+    # AUC (use raw logits)
+    auc = roc_auc_score(labels, logits)
+
+    # Accuracy using logits threshold at 0 (since using BCEWithLogits)
+    preds = (logits >= 0).astype(int)
+    labels_int = labels.astype(int)
+    acc = (preds == labels_int).mean()
+
+    avg_loss = total_loss / len(loader.dataset)
+
+    return avg_loss, auc, acc
+
+
+def eval_one_epoch(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0
+    all_labels = []
+    all_logits = []
+
     with torch.no_grad():
-        for x,y,_ in loader:
-            x,y = x.to(device), y.to(device)
-            logits = model(x)
-            pred = logits.argmax(1)
-            correct += (pred==y).sum().item(); total += y.numel()
-    return correct/total
+        for xb, yb, _ in loader:
+            xb = xb.to(device)
+            yb = yb.float().to(device).unsqueeze(1)
 
-def main():
-    cfg = CONFIG
+            out = model(xb)
+            loss = criterion(out, yb)
+
+            total_loss += loss.item() * xb.size(0)
+            all_labels.append(yb.cpu().numpy())
+            all_logits.append(out.cpu().numpy())
+
+    labels = np.vstack(all_labels)
+    logits = np.vstack(all_logits)
+
+    # AUC (use raw logits)
+    auc = roc_auc_score(labels, logits)
+
+    # Accuracy using logits threshold at 0 (since using BCEWithLogits)
+    preds = (logits >= 0).astype(int)
+    labels_int = labels.astype(int)
+    acc = (preds == labels_int).mean()
+
+    avg_loss = total_loss / len(loader.dataset)
+
+    return avg_loss, auc, acc
+
+
+# -------------------------
+# Main
+# -------------------------
+def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    Path(args.save_dir).mkdir(parents=True, exist_ok=True)
 
-    train_items = []
-    val_items = []
+    # Load global teacher dataloader
+    global_loader, global_ds = get_global_dataloader(
+        json_path=args.partitions_json,
+        batch_size=args.batch_size,
+        img_size=args.img_size,
+        shuffle=True,
+        num_workers=0
+    )
 
-    train_ds = ImageListDataset(train_items, transform=None)  # plug your tfms
-    val_ds   = ImageListDataset(val_items,   transform=None)
-    train_dl = DataLoader(train_ds, batch_size=cfg["federation"]["batch_size"], shuffle=True, num_workers=4)
-    val_dl   = DataLoader(val_ds,   batch_size=cfg["federation"]["batch_size"], shuffle=False, num_workers=4)
+    # Build pretrained ResNet18 (RGB input, output=1 logit)
+    model = models.resnet18(pretrained=True)
+    model.fc = nn.Linear(model.fc.in_features, 1)
+    model = model.to(device)
 
-    model = build_teacher(num_classes=cfg["data"]["num_classes"]).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg["federation"]["optimizer"]["lr"], weight_decay=cfg["federation"]["optimizer"]["weight_decay"])
+    # Compute pos_weight
+    labels = [lab for _, lab, in [(p, l) for p, l in global_ds.files]]
+    pos_idx = 1 if "PNEUMONIA" in global_ds.transform.__str__() else 1
+    n_pos = sum(1 for l in labels if l == pos_idx)
+    n_neg = len(labels) - n_pos
+    pos_weight = torch.tensor([n_neg / n_pos], dtype=torch.float32).to(device)
 
-    best = 0.0
-    for epoch in range(10):  # adjust
-        train_one_epoch(model, train_dl, opt, device)
-        acc = validate(model, val_dl, device)
-        if acc > best:
-            best = acc
-            os.makedirs("outputs/models", exist_ok=True)
-            torch.save({
-                "state_dict": model.state_dict(),
-                "arch": "resnet50",
-                "num_classes": cfg["data"]["num_classes"],
-                "epoch": epoch,
-                "metrics": {"val_acc": acc},
-                "version": "v1"
-            }, "outputs/models/teacher_model.pth")
-    print("best_val_acc:", best)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    # Train simple epochs
+    history = []
+    for epoch in range(1, args.epochs + 1):
+        train_loss, train_auc, train_acc = train_one_epoch(model, global_loader, optimizer, criterion, device)
+        # small dataset → same loader used for validation
+        val_loss, val_auc, val_acc = train_loss, train_auc, train_acc
+
+        history.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_auc": train_auc,
+            "train_acc": float(train_acc),
+            "val_loss": val_loss,
+            "val_auc": val_auc,
+            "val_acc": float(val_acc)
+        })
+
+        print(f"[{epoch}] loss={train_loss:.4f} | auc={train_auc:.4f} | acc={train_acc:.4f}")
+
+        # Save best model
+        torch.save(model.state_dict(), f"{args.save_dir}/teacher_model.pth")
+
+    # Save training history
+    with open(f"{args.save_dir}/teacher_history.json", "w") as f:
+        json.dump(history, f, indent=2)
+
+    print("Teacher training complete.")
+    print("Saved:", f"{args.save_dir}/teacher_model.pth")
+
+
+# -------------------------
+# CLI
+# -------------------------
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--partitions_json", type=str, default="outputs/partitions/partitions.json")
+    parser.add_argument("--save_dir", type=str, default="outputs/models")
+    parser.add_argument("--img_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    args = parser.parse_args()
+
+    main(args)
